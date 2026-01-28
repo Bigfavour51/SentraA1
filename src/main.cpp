@@ -1,156 +1,218 @@
 #include <Arduino.h>
-
 #include <Wire.h>
-#include <Adafruit_MPR121.h>
 
-/* ================== PINS ================== */
-#define IR1_PIN        15
-#define IR2_PIN        4
-#define PI_INT_PIN     27
-#define BUZZER_PIN     26
+// =====================================================
+// ================== PIN DEFINITIONS ==================
+// =====================================================
+#define IR1_PIN PA4
+#define IR2_PIN PA5
 
-#define UART_TX_PIN    17   // ESP32 TX → Pi RX
+#define LED_PIN PC13           // Active LOW
+#define PI_SERIAL Serial1      // PA9 TX, PA10 RX
 
-/* ================== CONFIG ================== */
-const float SENSOR_DISTANCE_M = 1.5;
-const unsigned long TIMEOUT_MS = 3000;
+// =====================================================
+// ================== MPR121 CONFIG ====================
+// =====================================================
+#define MPR121_ADDR 0x5A
+#define TOUCH_ELECTRODE 0
 
-/* ================== MPR121 ================== */
-Adafruit_MPR121 cap;
+#define MPR121_TOUCH_STATUS_L 0x00
+#define MPR121_ECR           0x5E
 
-/* ================== STATE ================== */
-volatile unsigned long t_ir1 = 0;
-volatile unsigned long t_ir2 = 0;
-volatile bool ir1Triggered = false;
-volatile bool ir2Triggered = false;
+// =====================================================
+// ================== SPEED CONFIG =====================
+// =====================================================
+#define IR_DISTANCE_METERS   0.15f
+#define SPEED_LIMIT_KMH      30.0f
 
-bool touchDetected = false;
+#define VEHICLE_TIMEOUT_US   1500000UL
+#define LOCKOUT_US           3000000UL
+#define IR_DEBOUNCE_US       200UL
 
-/* ================== CRC16 ================== */
-uint16_t crc16_ccitt(const uint8_t *data, size_t len) {
-  uint16_t crc = 0xFFFF;
-  while (len--) {
-    crc ^= (*data++) << 8;
-    for (uint8_t i = 0; i < 8; i++) {
-      crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
-    }
-  }
-  return crc;
+#define IR_ACTIVE LOW
+
+// =====================================================
+// ================== STATE =============================
+// =====================================================
+enum TriggerState {
+  IDLE,
+  IR1_SEEN,
+  IR2_SEEN
+};
+
+TriggerState state = IDLE;
+
+unsigned long t1_us = 0;
+unsigned long lastTriggerTime = 0;
+
+bool lastTouchState = false;
+bool currentTouch = false;
+
+// =====================================================
+// ================== I2C HELPERS ======================
+// =====================================================
+void writeRegister(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(MPR121_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  Wire.endTransmission();
 }
 
-/* ================== ISR ================== */
-void IRAM_ATTR ir1_isr() {
-  if (!ir1Triggered) {
-    t_ir1 = micros();
-    ir1Triggered = true;
-  }
+uint16_t readTouchStatus() {
+  Wire.beginTransmission(MPR121_ADDR);
+  Wire.write(MPR121_TOUCH_STATUS_L);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPR121_ADDR, (uint8_t)2);
+
+  uint16_t status = Wire.read();
+  status |= (Wire.read() << 8);
+  return status;
 }
 
-void IRAM_ATTR ir2_isr() {
-  if (ir1Triggered && !ir2Triggered) {
-    t_ir2 = micros();
-    ir2Triggered = true;
-  }
+// =====================================================
+// ================== MPR121 INIT ======================
+// =====================================================
+void initMPR121() {
+  writeRegister(MPR121_ECR, 0x00);
+
+  writeRegister(0x41, 12); // Touch threshold
+  writeRegister(0x42, 6);  // Release threshold
+
+  writeRegister(0x2B, 0x01);
+  writeRegister(0x2C, 0x01);
+  writeRegister(0x2D, 0x00);
+  writeRegister(0x2E, 0x00);
+
+  writeRegister(0x2F, 0x01);
+  writeRegister(0x30, 0x01);
+  writeRegister(0x31, 0xFF);
+  writeRegister(0x32, 0x02);
+
+  writeRegister(MPR121_ECR, 0x01); // Enable electrode 0 only
 }
 
-/* ================== BUZZER ================== */
-void beep(uint16_t ms) {
-  digitalWrite(BUZZER_PIN, HIGH);
-  delay(ms);
-  digitalWrite(BUZZER_PIN, LOW);
+// =====================================================
+// ================== HELPERS ===========================
+// =====================================================
+inline bool ir1Active() {
+  return digitalRead(IR1_PIN) == IR_ACTIVE;
 }
 
-/* ================== PI INTERRUPT ================== */
-void pulsePi() {
-  digitalWrite(PI_INT_PIN, HIGH);
-  delay(50);
-  digitalWrite(PI_INT_PIN, LOW);
+inline bool ir2Active() {
+  return digitalRead(IR2_PIN) == IR_ACTIVE;
 }
 
-/* ================== UART PACKET ================== */
-void send_uart_packet(float speed_kph, bool touch) {
-  uint8_t packet[15];
-  uint8_t idx = 0;
-
-  packet[idx++] = 0xAA;       // SOF
-  packet[idx++] = 0x01;       // Packet type
-
-  memcpy(&packet[idx], &speed_kph, 4);
-  idx += 4;
-
-  packet[idx++] = touch ? 1 : 0;
-
-  uint8_t eventFlags = 0x01;  // vehicle detected
-  if (touch) eventFlags |= 0x04;
-  packet[idx++] = eventFlags;
-
-  uint32_t ts = millis();
-  memcpy(&packet[idx], &ts, 4);
-  idx += 4;
-
-  uint16_t crc = crc16_ccitt(packet, idx);
-  packet[idx++] = crc >> 8;
-  packet[idx++] = crc & 0xFF;
-
-  packet[idx++] = 0x55;       // EOF
-
-  Serial1.write(packet, sizeof(packet));
+void sendEvent(float speedKmh, bool touch) {
+  PI_SERIAL.print("{\"event\":\"vehicle_detected\",\"speed_kmh\":");
+  PI_SERIAL.print(speedKmh, 1);
+  PI_SERIAL.print(",\"touch\":");
+  PI_SERIAL.print(touch ? "true" : "false");
+  PI_SERIAL.println(",\"source\":\"stm32-001\"}");
 }
 
-/* ================== SETUP ================== */
+// =====================================================
+// ================== SETUP =============================
+// =====================================================
 void setup() {
-  Serial.begin(115200);
-  Serial1.begin(115200, SERIAL_8N1, -1, UART_TX_PIN);
-
   pinMode(IR1_PIN, INPUT_PULLUP);
   pinMode(IR2_PIN, INPUT_PULLUP);
-  pinMode(PI_INT_PIN, OUTPUT);
-  pinMode(BUZZER_PIN, OUTPUT);
 
-  digitalWrite(PI_INT_PIN, LOW);
-  digitalWrite(BUZZER_PIN, LOW);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH); // LED OFF
 
-  attachInterrupt(digitalPinToInterrupt(IR1_PIN), ir1_isr, FALLING);
-  attachInterrupt(digitalPinToInterrupt(IR2_PIN), ir2_isr, FALLING);
+  PI_SERIAL.begin(115200);
+  Serial.begin(115200);
 
-  Wire.begin();
-  cap.begin(0x5A);
+  Wire.begin();        // PB6 / PB7
+  Wire.setClock(100000);
 
-  Serial.println("🚦 System ready");
+  delay(100);
+  initMPR121();
+
+  Serial.println("STM32 Sentra Controller Ready");
 }
 
-/* ================== LOOP ================== */
+// =====================================================
+// ================== LOOP ==============================
+// =====================================================
 void loop() {
+  unsigned long now_us = micros();
 
-  /* --- Touch detection --- */
-  uint16_t touched = cap.touched();
-  touchDetected = touched != 0;
+  // -------- Touch Handling --------
+  uint16_t touchStatus = readTouchStatus();
+  currentTouch = touchStatus & (1 << TOUCH_ELECTRODE);
 
-  /* --- Vehicle detection --- */
-  if (ir1Triggered) {
-
-    if (ir2Triggered) {
-      unsigned long delta_us = t_ir2 - t_ir1;
-      float speed = (SENSOR_DISTANCE_M / (delta_us / 1e6)) * 3.6;
-
-      Serial.print("Speed: ");
-      Serial.print(speed);
-      Serial.println(" km/h");
-
-      send_uart_packet(speed, touchDetected);
-      pulsePi();
-      beep(100);
-
-      ir1Triggered = false;
-      ir2Triggered = false;
-    }
-    else if ((millis() - (t_ir1 / 1000)) > TIMEOUT_MS) {
-      Serial.println("Timeout");
-      beep(500);
-      ir1Triggered = false;
-      ir2Triggered = false;
-    }
+  if (currentTouch && !lastTouchState) {
+    digitalWrite(LED_PIN, LOW);   // LED ON
+  } 
+  else if (!currentTouch && lastTouchState) {
+    digitalWrite(LED_PIN, HIGH);  // LED OFF
   }
+  lastTouchState = currentTouch;
 
-  delay(5);
+  // -------- Global lockout --------
+  if (now_us - lastTriggerTime < LOCKOUT_US) return;
+
+  // -------- Speed FSM --------
+  switch (state) {
+
+    case IDLE:
+      if (ir1Active()) {
+        delayMicroseconds(IR_DEBOUNCE_US);
+        if (ir1Active()) {
+          t1_us = micros();
+          state = IR1_SEEN;
+        }
+      }
+      else if (ir2Active()) {
+        delayMicroseconds(IR_DEBOUNCE_US);
+        if (ir2Active()) {
+          t1_us = micros();
+          state = IR2_SEEN;
+        }
+      }
+      break;
+
+    case IR1_SEEN:
+      if (ir2Active()) {
+        delayMicroseconds(IR_DEBOUNCE_US);
+        if (!ir2Active()) break;
+
+        float dt = (micros() - t1_us) / 1000000.0f;
+        if (dt > 0.0001f) {
+          float speed = (IR_DISTANCE_METERS / dt) * 3.6f;
+          if (speed >= SPEED_LIMIT_KMH) {
+            sendEvent(speed, currentTouch);
+          }
+        }
+
+        lastTriggerTime = micros();
+        state = IDLE;
+      }
+      else if (now_us - t1_us > VEHICLE_TIMEOUT_US) {
+        state = IDLE;
+      }
+      break;
+
+    case IR2_SEEN:
+      if (ir1Active()) {
+        delayMicroseconds(IR_DEBOUNCE_US);
+        if (!ir1Active()) break;
+
+        float dt = (micros() - t1_us) / 1000000.0f;
+        if (dt > 0.0001f) {
+          float speed = (IR_DISTANCE_METERS / dt) * 3.6f;
+          if (speed >= SPEED_LIMIT_KMH) {
+            sendEvent(speed, currentTouch);
+          }
+        }
+
+        lastTriggerTime = micros();
+        state = IDLE;
+      }
+      else if (now_us - t1_us > VEHICLE_TIMEOUT_US) {
+        state = IDLE;
+      }
+      break;
+  }
 }
