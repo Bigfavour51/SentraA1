@@ -1,0 +1,15 @@
+#include <Arduino.h>
+
+#define RelayPin PB5
+
+void setup() {
+  Serial.begin(9600);   // USART1  (PA9, PA10)
+  pinMode(RelayPin, OUTPUT);
+}
+
+void loop() {
+  digitalWrite(RelayPin, HIGH);
+  delay(3000);
+  digitalWrite(RelayPin, LOW);
+  delay(3000);
+}

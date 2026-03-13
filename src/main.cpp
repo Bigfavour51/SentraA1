@@ -23,8 +23,6 @@ void setup()
     touch.setThresholds(12, 6);
     TheftTrigger_Init(RELAY_PIN, 1000);
 }
-
-
 void loop()
 {
     if (speedDriver_speedAvailable())
