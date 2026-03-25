@@ -3,6 +3,7 @@
 Adafruit_MPR121 touch;
 
 uint16_t lastTouched = 0;
+uint32_t trigger_delay = 2000;
 
 // Timing
 uint32_t start_time {};
@@ -20,11 +21,11 @@ uint32_t last_touch_time = 0;
 
 
 
-void TheftTrigger_Init(uint8_t relayPin, uint8_t alarmpin, uint32_t delay_ms)
+void TheftTrigger_Init(uint8_t relayPin, uint8_t alarmpin)
 {
     relay_pin = relayPin;
     alarm_pin = alarmpin;
-    trigger_delay = delay_ms;
+    
 
     pinMode(relay_pin, OUTPUT);
     pinMode(alarm_pin, OUTPUT);
@@ -44,7 +45,6 @@ void TheftTrigger_Init(uint8_t relayPin, uint8_t alarmpin, uint32_t delay_ms)
 
 void detectTouch(void)
 {
-   
     uint16_t touched = touch.touched();
     uint32_t now = millis();
 
@@ -60,7 +60,6 @@ void detectTouch(void)
             {
                 last_touch_time = now;
 
-                
                     isTouched = true;
                 
                 if (!waiting && !triggered)
@@ -73,8 +72,6 @@ void detectTouch(void)
     }
 
     lastTouched = touched;
-
-    TheftTrigger_Update();
 }
 
 void TheftTrigger_Update(void)

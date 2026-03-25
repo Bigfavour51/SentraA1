@@ -10,7 +10,7 @@ extern uint16_t lastTouched;
 // Pins & config
 static uint8_t relay_pin;
 static uint8_t alarm_pin;
-static uint32_t trigger_delay;
+extern uint32_t trigger_delay;
 
 // Timing
 extern  uint32_t start_time;
@@ -28,9 +28,7 @@ extern  uint32_t last_touch_time;
 #define ACTIVE_TIME_MS 3000   // replaces delay(3000)
 
 
-void TheftTrigger_Init(uint8_t relayPin, uint8_t alarmpin, uint32_t delay_ms);
-
-void TheftTrigger_TouchDetected(void);
+void TheftTrigger_Init(uint8_t relayPin, uint8_t alarmpin);
 
 void TheftTrigger_Update(void);
 
