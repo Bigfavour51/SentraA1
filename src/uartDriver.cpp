@@ -6,6 +6,7 @@
 void uart_init(unsigned long baudrate)
 {
     PIserial.begin(baudrate);
+    PIserial.println("UART Initialized");
 }
 
 void uart_send_byte(float speed_kmh, uint8_t theft_trigger_state)

@@ -1,31 +1,34 @@
 #include "theftTrigger.h"
 
-Adafruit_MPR121 touch;
+// Pins
+static uint8_t touch_pin;
+static uint8_t relay_pin;
+static uint8_t alarm_pin;
 
-uint16_t lastTouched = 0;
+// Configuration
 uint32_t trigger_delay = 2000;
 
 // Timing
-uint32_t start_time {};
-uint32_t reset_time {};
+static uint32_t start_time = 0;
+static uint32_t reset_time = 0;
+static uint32_t last_touch_time = 0;
 
 // States
- bool waiting = false;
- bool triggered = false;
- bool isTouched = false;
+bool waiting = false;
+bool triggered = false;
+bool isTouched = false;
 
-// Debounce
-uint32_t last_touch_time = 0;
+// Constants
 #define TOUCH_DEBOUNCE_MS 100
-#define ACTIVE_TIME_MS 3000   // replaces delay(3000)
+#define ACTIVE_TIME_MS    5000
 
-
-
-void TheftTrigger_Init(uint8_t relayPin, uint8_t alarmpin)
+void TheftTrigger_Init(uint8_t touchPin, uint8_t relayPin,uint8_t alarmPin)
 {
+    touch_pin = touchPin;
     relay_pin = relayPin;
-    alarm_pin = alarmpin;
-    
+    alarm_pin = alarmPin;
+
+    pinMode(touch_pin, INPUT);
 
     pinMode(relay_pin, OUTPUT);
     pinMode(alarm_pin, OUTPUT);
@@ -33,65 +36,70 @@ void TheftTrigger_Init(uint8_t relayPin, uint8_t alarmpin)
     digitalWrite(relay_pin, LOW);
     digitalWrite(alarm_pin, LOW);
 
-    if (!touch.begin(0x5A))
+       for(size_t i = 0; i < 5; i++)
     {
-        // Serial.println("Touch sensor not initialized");
-        while(1);
+        digitalWrite(relay_pin, HIGH);
+        delay(200);
+        digitalWrite(relay_pin, LOW);
+        delay(200);
     }
-   
+
     waiting = false;
     triggered = false;
-}
-
-void detectTouch(void)
-{
-    uint16_t touched = touch.touched();
-    uint32_t now = millis();
-
-    for (uint8_t i = 0; i < 12; i++)
-    {
-        bool nowTouched = touched & (1 << i);
-        bool wasTouched = lastTouched & (1 << i);
-
-        // New touch with debounce
-        if (nowTouched && !wasTouched)
-        {
-            if (now - last_touch_time > TOUCH_DEBOUNCE_MS)
-            {
-                last_touch_time = now;
-
-                    isTouched = true;
-                
-                if (!waiting && !triggered)
-                {
-                    start_time = now;
-                    waiting = true;
-                }
-            }
-        }
-    }
-
-    lastTouched = touched;
+    isTouched = false;
 }
 
 void TheftTrigger_Update(void)
 {
+    static bool lastTouchState = false;
+
     uint32_t now = millis();
 
-    // Waiting before trigger
-    if (waiting && (now - start_time >= trigger_delay))
+    //--------------------------------------------------
+    // Touch Detection
+    //--------------------------------------------------
+
+    bool touchState = digitalRead(touch_pin);
+
+    if (touchState && !lastTouchState)
     {
+        if ((now - last_touch_time) > TOUCH_DEBOUNCE_MS)
+        {
+            last_touch_time = now;
+
+            isTouched = true;
+
+            if (!waiting && !triggered)
+            {
+                waiting = true;
+                start_time = now;
+            }
+        }
+    }
+
+    lastTouchState = touchState;
+
+    //--------------------------------------------------
+    // Trigger Delay
+    //--------------------------------------------------
+
+    if (waiting && ((now - start_time) >= trigger_delay))
+    {
+        
         digitalWrite(relay_pin, HIGH);
         digitalWrite(alarm_pin, HIGH);
 
-        triggered = true;
         waiting = false;
+        triggered = true;
 
-        reset_time = now; // start active timer
+        reset_time = now;
     }
 
-    // Auto reset after active period
-    if (triggered && (now - reset_time >= ACTIVE_TIME_MS))
+    //--------------------------------------------------
+    // Active Period
+    //--------------------------------------------------
+
+    if (triggered && ((now - reset_time) >= ACTIVE_TIME_MS))
     {
         TheftTrigger_Reset();
     }
